@@ -6,6 +6,8 @@ import collections
 import cProfile
 import pickle
 import time
+import heapq
+import dataclasses
 
 PAT = re.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
@@ -71,6 +73,49 @@ def _pre_tokenize(start, end, input_path, special_tokens):
         return freqs
 
 
+@dataclasses.dataclass
+class Entry:
+    pair: tuple[bytes, bytes]
+    count: int
+    removed: bool = False
+
+    def __lt__(self, that):
+        if self.count > that.count:
+            return True
+        if self.count == that.count:
+            return self.pair > that.pair
+        return False
+
+
+class PairFrequencies:
+
+    def __init__(self):
+        self.pq = []
+        self.entry_finder = {}
+
+    def update(self, pair, count):
+        if pair not in self.entry_finder:
+            new_entry = Entry(pair, count)
+        else:
+            old_entry = self.remove(pair)
+            new_entry = Entry(pair, old_entry.count + count)
+        heapq.heappush(self.pq, new_entry)
+        self.entry_finder[pair] = new_entry
+
+    def remove(self, pair):
+        entry = self.entry_finder.pop(pair)
+        entry.removed = True
+        return entry
+
+    def pop(self):
+        while self.pq:
+            entry = heapq.heappop(self.pq)
+            if not entry.removed:
+                del self.entry_finder[entry.pair]
+                return entry.pair
+        raise ValueError("Empty pq")
+
+
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -117,20 +162,26 @@ def train_bpe(
     for i in range(256):
         vocab[len(vocab)] = bytes([i])
 
-    pair_freqs = collections.Counter()
+    pair_counter = collections.Counter()
     for tokens, count in corpus.items():
-        if len(tokens) < 2:
+        num_tokens = len(tokens)
+        if num_tokens < 2:
             continue
-        for i in range(len(tokens) - 1):
-            pair_freqs[tokens[i : i + 2]] += count
+        for i in range(num_tokens - 1):
+            pair_counter[tokens[i : i + 2]] += count
+
+    pair_freqs = PairFrequencies()
+    for pair, count in pair_counter.items():
+        pair_freqs.update(pair, count)
 
     tic = time.time()
     merges = []
-    while len(vocab) < vocab_size:
-        top_pair = max(pair_freqs.items(), key=lambda x: (x[1], x[0]))[0]
-        del pair_freqs[top_pair]
+    token_id = len(vocab)
+    while token_id < vocab_size:
+        top_pair = pair_freqs.pop()
         merge = b"".join(top_pair)
-        vocab[len(vocab)] = merge
+        vocab[token_id] = merge
+        token_id += 1
         merges.append(top_pair)
 
         if len(vocab) % 5000 == 0:
@@ -149,11 +200,11 @@ def train_bpe(
             while i < num_tokens:
                 if i + 1 < num_tokens and tokens[i : i + 2] == top_pair:
                     if new_tokens:
-                        pair_freqs[(new_tokens[-1], tokens[i])] -= count
-                        pair_freqs[(new_tokens[-1], merge)] += count
+                        pair_freqs.update((new_tokens[-1], tokens[i]), -count)
+                        pair_freqs.update((new_tokens[-1], merge), count)
                     if i + 2 < num_tokens:
-                        pair_freqs[(tokens[i + 1], tokens[i + 2])] -= count
-                        pair_freqs[(merge, tokens[i + 2])] += count
+                        pair_freqs.update((tokens[i + 1], tokens[i + 2]), -count)
+                        pair_freqs.update((merge, tokens[i + 2]), count)
                     new_tokens.append(merge)
                     i += 2
                 else:
