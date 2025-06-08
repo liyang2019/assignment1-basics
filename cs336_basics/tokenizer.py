@@ -124,6 +124,7 @@ def train_bpe(
         for i in range(len(tokens) - 1):
             pair_freqs[tokens[i : i + 2]] += count
 
+    tic = time.time()
     merges = []
     while len(vocab) < vocab_size:
         top_pair = max(pair_freqs.items(), key=lambda x: (x[1], x[0]))[0]
@@ -132,16 +133,25 @@ def train_bpe(
         vocab[len(vocab)] = merge
         merges.append(top_pair)
 
+        if len(vocab) % 5000 == 0:
+            print(
+                f"len(vocab) {len(vocab)} used {(time.time() - tic) / 60 / 60:.2f} hours"
+            )
+            tic = time.time()
+
         merged_corpus = {}
         for tokens, count in corpus.items():
+            num_tokens = len(tokens)
+            if num_tokens < 2:
+                continue
             new_tokens = []
             i = 0
-            while i < len(tokens):
-                if i + 1 < len(tokens) and tokens[i : i + 2] == top_pair:
+            while i < num_tokens:
+                if i + 1 < num_tokens and tokens[i : i + 2] == top_pair:
                     if new_tokens:
                         pair_freqs[(new_tokens[-1], tokens[i])] -= count
                         pair_freqs[(new_tokens[-1], merge)] += count
-                    if i + 2 < len(tokens):
+                    if i + 2 < num_tokens:
                         pair_freqs[(tokens[i + 1], tokens[i + 2])] -= count
                         pair_freqs[(merge, tokens[i + 2])] += count
                     new_tokens.append(merge)
@@ -152,28 +162,41 @@ def train_bpe(
             merged_corpus[tuple(new_tokens)] = count
         corpus = merged_corpus
 
+    print(f"len(vocab) {len(vocab)} used {(time.time() - tic) / 60 / 60:.2f} hours")
+
     return vocab, merges
 
 
 if __name__ == "__main__":
-    #     cProfile.run(
-    #         """
-    # vocab, merges = train_bpe(
-    #     "/Users/liyang2029/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt",
-    #     vocab_size=10000,
-    #     special_tokens=["<|endoftext|>"],
-    # )
-    #         """,
-    #         sort="tottime",
-    #     )
-    tic = time.time()
-    data_dir = "/Users/liyang2029/assignment1-basics/data/"
-    data_set = "owt_valid"
-    vocab, merges = train_bpe(
-        f"{data_dir}/{data_set}.txt", vocab_size=32000, special_tokens=["<|endoftext|>"]
-    )
-    print('time elapsed', time.time() - tic)
-    with open(f"{data_dir}/{data_set}-vocab.pickle", "wb") as f:
-        pickle.dump(vocab, f)
-    with open(f"{data_dir}/{data_set}-merges.pickle", "wb") as f:
-        pickle.dump(merges, f)
+    data_dir = "/home/liyang/github repos/cs336-2025/assignment1-basics/data"
+    run_profile = True
+    if run_profile:
+        cProfile.run(
+            f"""
+vocab, merges = train_bpe(
+    "{data_dir}/TinyStoriesV2-GPT4-valid.txt",
+    vocab_size=10000,
+    special_tokens=["<|endoftext|>"],
+)
+                """,
+            sort="tottime",
+        )
+    else:
+        for data_set, vocab_size in [
+            ("TinyStoriesV2-GPT4-valid", 10000),
+            ("TinyStoriesV2-GPT4-train", 10000),
+            ("owt_valid", 32000),
+            ("owt_train", 32000),
+        ]:
+            tic = time.time()
+            data_dir = "/home/liyang/github repos/cs336-2025/assignment1-basics/data"
+            vocab, merges = train_bpe(
+                f"{data_dir}/{data_set}.txt",
+                vocab_size=vocab_size,
+                special_tokens=["<|endoftext|>"],
+            )
+            print(f"total time elapsed {(time.time() - tic) / 60 / 60:.2f} hours")
+            with open(f"{data_dir}/{data_set}-vocab.pickle", "wb") as f:
+                pickle.dump(vocab, f)
+            with open(f"{data_dir}/{data_set}-merges.pickle", "wb") as f:
+                pickle.dump(merges, f)
