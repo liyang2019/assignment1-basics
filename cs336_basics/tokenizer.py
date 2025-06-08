@@ -157,18 +157,19 @@ def train_bpe(
             [special_tokens] * num_chunks,
         )
         corpus = sum(p.starmap(_pre_tokenize, args), start=collections.Counter())
+        corpus = [[list(k), v, len(k)] for k, v in corpus.items()]
 
     vocab = {i: tk.encode("utf-8") for i, tk in enumerate(special_tokens)}
     for i in range(256):
         vocab[len(vocab)] = bytes([i])
 
     pair_counter = collections.Counter()
-    for tokens, count in corpus.items():
+    for tokens, count, _ in corpus:
         num_tokens = len(tokens)
         if num_tokens < 2:
             continue
         for i in range(num_tokens - 1):
-            pair_counter[tokens[i : i + 2]] += count
+            pair_counter[tuple(tokens[i : i + 2])] += count
 
     pair_freqs = PairFrequencies()
     for pair, count in pair_counter.items():
@@ -190,28 +191,32 @@ def train_bpe(
             )
             tic = time.time()
 
-        merged_corpus = {}
-        for tokens, count in corpus.items():
-            num_tokens = len(tokens)
+        for chunk in corpus:
+            tokens, count, num_tokens = chunk
             if num_tokens < 2:
                 continue
-            new_tokens = []
-            i = 0
-            while i < num_tokens:
-                if i + 1 < num_tokens and tokens[i : i + 2] == top_pair:
-                    if new_tokens:
-                        pair_freqs.update((new_tokens[-1], tokens[i]), -count)
-                        pair_freqs.update((new_tokens[-1], merge), count)
-                    if i + 2 < num_tokens:
-                        pair_freqs.update((tokens[i + 1], tokens[i + 2]), -count)
-                        pair_freqs.update((merge, tokens[i + 2]), count)
-                    new_tokens.append(merge)
-                    i += 2
-                else:
-                    new_tokens.append(tokens[i])
+            i, j = 0, 0
+            while j < num_tokens:
+                if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != top_pair:
+                    tokens[i] = tokens[j]
                     i += 1
-            merged_corpus[tuple(new_tokens)] = count
-        corpus = merged_corpus
+                    j += 1
+                else:
+                    curr, next = tokens[j], tokens[j + 1]
+                    tokens[i] = merge
+                    if i > 0:
+                        left = tokens[i - 1]
+                        pair_freqs.update((left, curr), -count)
+                        pair_freqs.update((left, merge), count)
+                    if j + 2 < num_tokens:
+                        right = tokens[j + 2]
+                        pair_freqs.update((next, right), -count)
+                        pair_freqs.update((merge, right), count)
+                    i += 1
+                    j += 2
+                    chunk[2] -= 1
+            
+            tokens[:] = tokens[:i]
 
     print(f"len(vocab) {len(vocab)} used {(time.time() - tic) / 60 / 60:.2f} hours")
 
@@ -234,9 +239,9 @@ vocab, merges = train_bpe(
         )
     else:
         for data_set, vocab_size in [
-            ("TinyStoriesV2-GPT4-valid", 10000),
-            ("TinyStoriesV2-GPT4-train", 10000),
-            ("owt_valid", 32000),
+            # ("TinyStoriesV2-GPT4-valid", 10000),
+            # ("TinyStoriesV2-GPT4-train", 10000),
+            # ("owt_valid", 32000),
             ("owt_train", 32000),
         ]:
             tic = time.time()
