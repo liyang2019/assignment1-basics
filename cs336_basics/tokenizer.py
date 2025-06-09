@@ -8,10 +8,13 @@ import pickle
 import time
 import heapq
 import dataclasses
+import functools
+import datetime
 
 PAT = re.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
+MULTIPROCESSING_MERGE = False
 
 
 def find_chunk_boundaries(
@@ -116,6 +119,48 @@ class PairFrequencies:
         raise ValueError("Empty pq")
 
 
+def _merge(corpus, pair):
+    merge = b"".join(pair)
+    updates = collections.defaultdict(int)
+    for chunk in corpus:
+        tokens, count, num_tokens = chunk
+        if num_tokens < 2:
+            continue
+        i, j = 0, 0
+        while j < num_tokens:
+            if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != pair:
+                tokens[i] = tokens[j]
+                i += 1
+                j += 1
+            else:
+                curr, next = tokens[j], tokens[j + 1]
+                tokens[i] = merge
+                if i > 0:
+                    left = tokens[i - 1]
+                    updates[(left, curr)] -= count
+                    updates[(left, merge)] += count
+                if j + 2 < num_tokens:
+                    right = tokens[j + 2]
+                    updates[(next, right)] -= count
+                    updates[(merge, right)] += count
+                i += 1
+                j += 2
+                chunk[2] -= 1
+
+        tokens[:] = tokens[:i]
+    return corpus, updates
+
+
+def _merge_multiprocessing(num_chunks, block_corpus, pair):
+    with multiprocessing.Pool(num_chunks) as p:
+        args = zip(block_corpus, [pair] * num_chunks)
+        block_corpus[:], block_updates = zip(*p.starmap(_merge, args))
+    updates = collections.defaultdict(int)
+    for block_update in block_updates:
+        for pair, update in block_update.items():
+            updates[pair] += update
+    return block_corpus, updates
+
 def train_bpe(
     input_path: str | os.PathLike,
     vocab_size: int,
@@ -143,7 +188,7 @@ def train_bpe(
                 representing that <token1> was merged with <token2>.
                 Merges are ordered by order of creation.
     """
-    num_chunks = multiprocessing.cpu_count() - 1
+    num_chunks = multiprocessing.cpu_count() - 4
     with open(input_path, "rb") as f:
         boundaries = find_chunk_boundaries(
             f, num_chunks, "<|endoftext|>".encode("utf-8")
@@ -158,6 +203,8 @@ def train_bpe(
         )
         corpus = sum(p.starmap(_pre_tokenize, args), start=collections.Counter())
         corpus = [[list(k), v, len(k)] for k, v in corpus.items()]
+
+    print(f"corpus size: {len(corpus)}")
 
     vocab = {i: tk.encode("utf-8") for i, tk in enumerate(special_tokens)}
     for i in range(256):
@@ -175,7 +222,15 @@ def train_bpe(
     for pair, count in pair_counter.items():
         pair_freqs.update(pair, count)
 
-    tic = time.time()
+    if MULTIPROCESSING_MERGE:
+        block_size = (len(corpus) - 1) // num_chunks + 1
+        block_corpus = []
+        for i in range(num_chunks):
+            block_corpus.append(corpus[i * block_size : (i + 1) * block_size])
+
+        print(f"block sizes: {[len(b) for b in block_corpus]}")
+
+    tic = datetime.datetime.now()
     merges = []
     token_id = len(vocab)
     while token_id < vocab_size:
@@ -185,47 +240,25 @@ def train_bpe(
         token_id += 1
         merges.append(top_pair)
 
-        if len(vocab) % 5000 == 0:
-            print(
-                f"len(vocab) {len(vocab)} used {(time.time() - tic) / 60 / 60:.2f} hours"
-            )
-            tic = time.time()
+        if MULTIPROCESSING_MERGE:
+            _, updates = _merge_multiprocessing(num_chunks, block_corpus, top_pair)
+        else:
+            _, updates = _merge(corpus, top_pair)
 
-        for chunk in corpus:
-            tokens, count, num_tokens = chunk
-            if num_tokens < 2:
-                continue
-            i, j = 0, 0
-            while j < num_tokens:
-                if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != top_pair:
-                    tokens[i] = tokens[j]
-                    i += 1
-                    j += 1
-                else:
-                    curr, next = tokens[j], tokens[j + 1]
-                    tokens[i] = merge
-                    if i > 0:
-                        left = tokens[i - 1]
-                        pair_freqs.update((left, curr), -count)
-                        pair_freqs.update((left, merge), count)
-                    if j + 2 < num_tokens:
-                        right = tokens[j + 2]
-                        pair_freqs.update((next, right), -count)
-                        pair_freqs.update((merge, right), count)
-                    i += 1
-                    j += 2
-                    chunk[2] -= 1
-            
-            tokens[:] = tokens[:i]
+        for pair, count in updates.items():
+            pair_freqs.update(pair, count)
 
-    print(f"len(vocab) {len(vocab)} used {(time.time() - tic) / 60 / 60:.2f} hours")
+        if token_id % 100 == 0 or token_id == vocab_size:
+            print(f"len(vocab) {len(vocab)} used {datetime.datetime.now() - tic}")
+            tic = datetime.datetime.now()
+            print(f"num updates {len(updates)}")
 
     return vocab, merges
 
 
 if __name__ == "__main__":
     data_dir = "/home/liyang/github repos/cs336-2025/assignment1-basics/data"
-    run_profile = True
+    run_profile = False
     if run_profile:
         cProfile.run(
             f"""
