@@ -14,7 +14,6 @@ import datetime
 PAT = re.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 )
-MULTIPROCESSING_MERGE = False
 
 
 def find_chunk_boundaries(
@@ -119,13 +118,12 @@ class PairFrequencies:
         raise ValueError("Empty pq")
 
 
-def _merge(corpus, pair):
+def _merge(pair, pair_locations, corpus):
     merge = b"".join(pair)
     updates = collections.defaultdict(int)
-    for chunk in corpus:
+    for cid in pair_locations.pop(pair):
+        chunk = corpus[cid]
         tokens, count, num_tokens = chunk
-        if num_tokens < 2:
-            continue
         i, j = 0, 0
         while j < num_tokens:
             if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != pair:
@@ -139,27 +137,18 @@ def _merge(corpus, pair):
                     left = tokens[i - 1]
                     updates[(left, curr)] -= count
                     updates[(left, merge)] += count
+                    pair_locations[(left, merge)].add(cid)
                 if j + 2 < num_tokens:
                     right = tokens[j + 2]
                     updates[(next, right)] -= count
                     updates[(merge, right)] += count
+                    pair_locations[(merge, right)].add(cid)
                 i += 1
                 j += 2
                 chunk[2] -= 1
-
         tokens[:] = tokens[:i]
-    return corpus, updates
+    return updates
 
-
-def _merge_multiprocessing(num_chunks, block_corpus, pair):
-    with multiprocessing.Pool(num_chunks) as p:
-        args = zip(block_corpus, [pair] * num_chunks)
-        block_corpus[:], block_updates = zip(*p.starmap(_merge, args))
-    updates = collections.defaultdict(int)
-    for block_update in block_updates:
-        for pair, update in block_update.items():
-            updates[pair] += update
-    return block_corpus, updates
 
 def train_bpe(
     input_path: str | os.PathLike,
@@ -211,24 +200,19 @@ def train_bpe(
         vocab[len(vocab)] = bytes([i])
 
     pair_counter = collections.Counter()
-    for tokens, count, _ in corpus:
+    pair_locations = collections.defaultdict(set)
+    for cid, (tokens, count, _) in enumerate(corpus):
         num_tokens = len(tokens)
         if num_tokens < 2:
             continue
         for i in range(num_tokens - 1):
-            pair_counter[tuple(tokens[i : i + 2])] += count
+            pair = tuple(tokens[i : i + 2])
+            pair_counter[pair] += count
+            pair_locations[pair].add(cid)
 
     pair_freqs = PairFrequencies()
     for pair, count in pair_counter.items():
         pair_freqs.update(pair, count)
-
-    if MULTIPROCESSING_MERGE:
-        block_size = (len(corpus) - 1) // num_chunks + 1
-        block_corpus = []
-        for i in range(num_chunks):
-            block_corpus.append(corpus[i * block_size : (i + 1) * block_size])
-
-        print(f"block sizes: {[len(b) for b in block_corpus]}")
 
     tic = datetime.datetime.now()
     merges = []
@@ -240,10 +224,33 @@ def train_bpe(
         token_id += 1
         merges.append(top_pair)
 
-        if MULTIPROCESSING_MERGE:
-            _, updates = _merge_multiprocessing(num_chunks, block_corpus, top_pair)
-        else:
-            _, updates = _merge(corpus, top_pair)
+        updates = collections.defaultdict(int)
+        for cid in pair_locations.pop(top_pair):
+            chunk = corpus[cid]
+            tokens, count, num_tokens = chunk
+            i, j = 0, 0
+            while j < num_tokens:
+                if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != top_pair:
+                    tokens[i] = tokens[j]
+                    i += 1
+                    j += 1
+                else:
+                    curr, next = tokens[j], tokens[j + 1]
+                    tokens[i] = merge
+                    if i > 0:
+                        left = tokens[i - 1]
+                        updates[(left, curr)] -= count
+                        updates[(left, merge)] += count
+                        pair_locations[(left, merge)].add(cid)
+                    if j + 2 < num_tokens:
+                        right = tokens[j + 2]
+                        updates[(next, right)] -= count
+                        updates[(merge, right)] += count
+                        pair_locations[(merge, right)].add(cid)
+                    i += 1
+                    j += 2
+                    chunk[2] -= 1
+            tokens[:] = tokens[:i]
 
         for pair, count in updates.items():
             pair_freqs.update(pair, count)
