@@ -8,9 +8,7 @@ import heapq
 import dataclasses
 import datetime
 
-PAT = re.compile(
-    r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-)
+from cs336_basics import common
 
 
 def find_chunk_boundaries(
@@ -65,8 +63,16 @@ def _pre_tokenize(start, end, input_path, special_tokens):
         f.seek(start)
         text = f.read(end - start).decode("utf-8", errors="ignore")
         freqs = collections.Counter()
-        for chunk in re.split("|".join(special_tokens), text):
-            for m in re.finditer(PAT, chunk):
+        special_tokens_escaped = sorted(
+            [re.escape(st) for st in special_tokens], key=lambda p: -len(p)
+        )
+        chunks = (
+            re.split(f"{'|'.join(special_tokens_escaped)}", text)
+            if special_tokens_escaped
+            else [text]
+        )
+        for chunk in chunks:
+            for m in re.finditer(common.PAT, chunk):
                 key = tuple(bytes([b]) for b in m.group(0).encode("utf-8"))
                 freqs[key] += 1
         return freqs
