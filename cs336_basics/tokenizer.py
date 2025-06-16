@@ -1,15 +1,8 @@
-import os
 from typing import Iterable, Iterator
-import multiprocessing
 import regex as re
 import collections
-import cProfile
 import pickle
-import time
-import heapq
-import dataclasses
-import functools
-import datetime
+import itertools
 
 from cs336_basics import common
 
@@ -34,6 +27,7 @@ class Tokenizer:
         )
         self.mini_chunk_size = 4096  # Read ahead by 4k chars at a time
 
+    @classmethod
     def from_files(
         cls,
         vocab_filepath: str,
@@ -46,68 +40,74 @@ class Tokenizer:
             merges = pickle.load(f)
         return cls(vocab, merges, special_tokens)
 
-    def _merge(self, tokens: list[bytes]) -> list[bytes]:
-        num_tokens = len(tokens)
-        seen_pairs = set()
-        for i in range(len(tokens) - 1):
-            seen_pairs.add((tokens[i], tokens[i + 1]))
-        for pair in self.merges:
-            if num_tokens < 2:
-                return
-            if pair not in seen_pairs:
-                continue
-            merge = b"".join(pair)
-            i, j = 0, 0
-            while j < num_tokens:
-                if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != pair:
-                    tokens[i] = tokens[j]
-                    j += 1
-                else:
-                    tokens[i] = merge
-                    if i > 0:
-                        seen_pairs.add((tokens[i - 1], merge))
-                    if j + 2 < num_tokens:
-                        seen_pairs.add((merge, tokens[j + 2]))
-                    j += 2
-                i += 1
-            num_tokens = i
-            tokens[:] = tokens[:num_tokens]
-
-    def _encode(self, tokens: list[bytes]) -> Iterator[int]:
-        self._merge(tokens)
-        for token in tokens:
-            yield self.id_by_token[token]
-
     def encode(self, text: str) -> list[int]:
-        token_ids = []
+        locs_by_pre_token = collections.defaultdict(list)
         chunks = (
             re.split(self.special_tokens_pattern, text)
             if self.special_tokens
             else [text]
         )
+        num_pre_tokens = 0
         for chunk in chunks:
             if chunk in self.special_tokens:
-                token_ids.append(self.id_by_token[chunk.encode("utf-8")])
+                locs_by_pre_token[chunk].append(num_pre_tokens)
+                num_pre_tokens += 1
                 continue
             for m in re.finditer(common.PAT, chunk):
-                tokens = [bytes([b]) for b in m.group(0).encode("utf-8")]
-                token_ids.extend(self._encode(tokens))
-        return token_ids
+                locs_by_pre_token[m.group(0)].append(num_pre_tokens)
+                num_pre_tokens += 1
+        corpus = []
+        for pre_token, locs in locs_by_pre_token.items():
+            if pre_token in self.special_tokens:
+                tokens = [pre_token.encode("utf-8")]
+            else:
+                tokens = [bytes([b]) for b in pre_token.encode("utf-8")]
+            corpus.append([tokens, locs, len(tokens)])
+
+        pair_locations = collections.defaultdict(set)
+        for cid, (tokens, locs, num_tokens) in enumerate(corpus):
+            if num_tokens < 2:
+                continue
+            for i in range(num_tokens - 1):
+                pair = tuple(tokens[i : i + 2])
+                pair_locations[pair].add(cid)
+
+        for pair in self.merges:
+            if pair not in pair_locations:
+                continue
+            merge = b"".join(pair)
+            for cid in pair_locations.pop(pair):
+                pre_token = corpus[cid]
+                tokens, locs, num_tokens = pre_token
+                i, j = 0, 0
+                while j < num_tokens:
+                    if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != pair:
+                        tokens[i] = tokens[j]
+                        i += 1
+                        j += 1
+                    else:
+                        tokens[i] = merge
+                        if i > 0:
+                            left = tokens[i - 1]
+                            pair_locations[(left, merge)].add(cid)
+                        if j + 2 < num_tokens:
+                            right = tokens[j + 2]
+                            pair_locations[(merge, right)].add(cid)
+                        i += 1
+                        j += 2
+                        pre_token[2] -= 1
+                tokens[:] = tokens[:i]
+
+        all_token_ids = [None] * num_pre_tokens
+        for tokens, locs, _ in corpus:
+            token_ids = [self.id_by_token[t] for t in tokens]
+            for loc in locs:
+                all_token_ids[loc] = token_ids
+        return list(itertools.chain.from_iterable(all_token_ids))
 
     def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
         for text in iterable:
-            chunks = (
-                re.splititer(self.special_tokens_pattern, text)
-                if self.special_tokens
-                else [text]
-            )
-            for chunk in chunks:
-                if chunk in self.special_tokens:
-                    yield self.id_by_token[chunk.encode("utf-8")]
-                    continue
-                for m in re.finditer(common.PAT, chunk):
-                    tokens = [bytes([b]) for b in m.group(0).encode("utf-8")]
-                    yield from self._encode(tokens)
+            yield from self.encode(text)
 
     def decode(self, ids: list[int]) -> str:
         tokens = [self.vocab.get(x, "�".encode("utf-8")) for x in ids]

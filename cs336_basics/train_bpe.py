@@ -172,8 +172,7 @@ def train_bpe(
 
     pair_counter = collections.Counter()
     pair_locations = collections.defaultdict(set)
-    for cid, (tokens, count, _) in enumerate(corpus):
-        num_tokens = len(tokens)
+    for cid, (tokens, count, num_tokens) in enumerate(corpus):
         if num_tokens < 2:
             continue
         for i in range(num_tokens - 1):
@@ -197,8 +196,8 @@ def train_bpe(
 
         updates = collections.defaultdict(int)
         for cid in pair_locations.pop(top_pair):
-            chunk = corpus[cid]
-            tokens, count, num_tokens = chunk
+            pre_token = corpus[cid]
+            tokens, count, num_tokens = pre_token
             i, j = 0, 0
             while j < num_tokens:
                 if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != top_pair:
@@ -220,7 +219,7 @@ def train_bpe(
                         pair_locations[(merge, right)].add(cid)
                     i += 1
                     j += 2
-                    chunk[2] -= 1
+                    pre_token[2] -= 1
             tokens[:] = tokens[:i]
 
         for pair, count in updates.items():
