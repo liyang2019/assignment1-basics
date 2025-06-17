@@ -8,8 +8,7 @@ import torch
 import math
 import numpy as np
 import os
-
-import torch.optim.optimizer
+from ptflops import get_model_complexity_info
 
 
 def _truncated_normal_init(weights: nn.Parameter):
@@ -197,7 +196,7 @@ class MultiHeadSelfAttention(nn.Module):
         token_positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if token_positions is None:
-            token_positions = torch.arange(x.shape[-2])
+            token_positions = torch.arange(x.shape[-2], device=x.device)
         else:
             print(token_positions)
         q = self.q_proj(x)
@@ -261,11 +260,6 @@ class TransformerLM(nn.Module):
         self.token_embeddings = Embedding(
             vocab_size, d_model, device=device, dtype=dtype
         )
-        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
-        self.lm_head = nn.Linear(
-            d_model, vocab_size, bias=False, device=device, dtype=dtype
-        )
-        _truncated_normal_init(self.lm_head.weight)
         self.layers = nn.ModuleList(
             TransformerBlock(
                 d_model,
@@ -277,6 +271,11 @@ class TransformerLM(nn.Module):
             )
             for _ in range(num_layers)
         )
+        self.ln_final = RMSNorm(d_model, device=device, dtype=dtype)
+        self.lm_head = nn.Linear(
+            d_model, vocab_size, bias=False, device=device, dtype=dtype
+        )
+        _truncated_normal_init(self.lm_head.weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.token_embeddings(x)
@@ -284,6 +283,57 @@ class TransformerLM(nn.Module):
             x = layer(x)
         x = self.ln_final(x)
         return self.lm_head(x)
+
+
+def transformer_accounting(
+    vocab_size: int,
+    context_length: int,
+    num_layers: int,
+    d_model: int,
+    num_heads: int,
+    d_ff: int,
+):
+    print(f"vocab_size {vocab_size}")
+    print(f"context_length {context_length}")
+    print(f"num_layers {num_layers}")
+    print(f"d_model {d_model}")
+    print(f"num_heads {num_heads}")
+    print(f"d_ff {d_ff}")
+    num_embedding_params = vocab_size * d_model
+    num_attn_params = d_model * d_model * 4 + d_model
+    num_ffn_params = d_model * d_ff * 3 + d_model
+    num_ln_final_params = d_model
+    num_lm_head_params = d_model * vocab_size
+    num_total_params = (
+        num_embedding_params
+        + (num_attn_params + num_ffn_params) * num_layers
+        + num_ln_final_params
+        + num_lm_head_params
+    )
+    print(f"total num params: {num_total_params}")
+    print(f"total memory: {num_total_params * 2 / 2**30:.4f} GiB")
+
+    embedding_flops = context_length * vocab_size * d_model * 2
+    print(f"embedding_flops {embedding_flops / 1e12} tFLOPs")
+    attn_proj_flops = context_length * d_model * d_model * 2 * 4 * num_layers
+    print(f"attn_proj_flops {attn_proj_flops / 1e12} tFLOPs")
+    attn_qk_flops = context_length * d_model * context_length * 2 * num_layers
+    print(f"attn_kv_flops {attn_qk_flops / 1e12} tFLOPs")
+    attn_v_flops = context_length * context_length * d_model * 2 * num_layers
+    print(f"attn_v_flops {attn_v_flops / 1e12} tFLOPs")
+    ffn_proj_flops = context_length * d_model * d_ff * 2 * 3 * num_layers
+    print(f"ffn_proj_flops {ffn_proj_flops / 1e12} tFLOPs")
+    output_flops = context_length * d_model * vocab_size * 2
+    print(f"output_flops {output_flops / 1e12} tFLOPs")
+    total_flops = (
+        embedding_flops
+        + attn_proj_flops
+        + attn_qk_flops
+        + attn_v_flops
+        + ffn_proj_flops
+        + output_flops
+    )
+    print(f"total_flops {total_flops / 1e12} tFLOPs")
 
 
 def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
@@ -430,11 +480,46 @@ def load_checkpoint(
 
 
 if __name__ == "__main__":
-    weights = torch.nn.Parameter(5 * torch.randn((10, 10)))
-    opt = SGD([weights], lr=1e3)
-    for t in range(10):
-        opt.zero_grad()  # Reset the gradients for all learnable parameters.
-        loss = (weights**2).mean()  # Compute a scalar loss value.
-        print(loss.cpu().item())
-        loss.backward()  # Run backward pass, which computes gradients.
-        opt.step()  # Run optimizer step
+    # weights = torch.nn.Parameter(5 * torch.randn((10, 10)))
+    # opt = SGD([weights], lr=1e3)
+    # for t in range(10):
+    #     opt.zero_grad()  # Reset the gradients for all learnable parameters.
+    #     loss = (weights**2).mean()  # Compute a scalar loss value.
+    #     print(loss.cpu().item())
+    #     loss.backward()  # Run backward pass, which computes gradients.
+    #     opt.step()  # Run optimizer step
+
+    # os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+    context_length = 2048
+    m = TransformerLM(
+        d_model=1600,
+        num_heads=25,
+        d_ff=6400,
+        rope_theta=2000,
+        vocab_size=50257,
+        context_length=context_length,
+        num_layers=48,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    num_total_params = sum(np.prod(p.shape) for p in m.parameters())
+    print(f"total num params {num_total_params}")
+    get_model_complexity_info(
+        m,
+        (1, context_length),
+        input_constructor=lambda res: torch.ones(res, dtype=torch.int64).to("cuda"),
+        as_strings=True,
+        backend="pytorch",
+        print_per_layer_stat=True,
+        verbose=True,
+    )
+
+    transformer_accounting(
+        vocab_size=50257,
+        context_length=context_length,
+        num_layers=48,
+        d_model=1600,
+        num_heads=25,
+        d_ff=6400,
+    )
