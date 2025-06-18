@@ -10,6 +10,8 @@ import numpy as np
 import os
 from ptflops import get_model_complexity_info
 
+from cs336_basics import tokenizer
+
 
 def _truncated_normal_init(weights: nn.Parameter):
     assert weights.ndim == 2
@@ -54,7 +56,7 @@ class Embedding(nn.Module):
 
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         token_ids_one_hot = torch.nn.functional.one_hot(
-            token_ids, self.num_embeddings
+            token_ids.to(torch.int64), self.num_embeddings
         ).to(self.weight.dtype)
         return einsum(token_ids_one_hot, self.weight, "... v, v d -> ... d")
 
@@ -256,6 +258,7 @@ class TransformerLM(nn.Module):
         dtype: torch.dtype | None = None,
     ):
         super().__init__()
+        self.device = device
         rope = RoPE(rope_theta, d_model // num_heads, context_length, device=device)
         self.token_embeddings = Embedding(
             vocab_size, d_model, device=device, dtype=dtype
@@ -283,6 +286,38 @@ class TransformerLM(nn.Module):
             x = layer(x)
         x = self.ln_final(x)
         return self.lm_head(x)
+
+    def decode_step(
+        self, x: torch.Tensor, temperature: float, top_p: int | None
+    ) -> torch.Tensor:
+        assert x.ndim == 1
+        outputs = self.forward(x.view(1, -1))
+        logits = outputs[0, -1, :]
+        if temperature == 0:
+            return torch.argmax(logits)
+        logits = logits.to(torch.float32)
+        probs = softmax(logits / (temperature + 1e-8))
+        if top_p:
+            probs = probs.topk(top_p).values
+        return torch.distributions.Categorical(probs).sample()
+
+    def decode(
+        self,
+        x: torch.Tensor,
+        max_num_tokens: int,
+        eos_id: str = 0,
+        temperature: float = 1.0,
+        top_p: int | None = None,
+    ) -> torch.Tensor:
+        max_num_decoded = max_num_tokens - x.shape[-1]
+        decoded = []
+        while len(decoded) < max_num_decoded:
+            idx = self.decode_step(x, temperature, top_p)
+            decoded.append(idx)
+            if idx == eos_id:
+                break
+            x = torch.concat([x, idx.unsqueeze(0)])
+        return torch.stack(decoded)
 
 
 def transformer_accounting(
@@ -339,8 +374,8 @@ def transformer_accounting(
 def cross_entropy(inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
     inputs -= inputs.max(dim=-1, keepdim=True)[0]
     log_z = torch.log(torch.exp(inputs).sum(dim=-1))
-    targets = torch.nn.functional.one_hot(targets, inputs.shape[-1]).to(inputs.dtype)
-    loss = -einsum(inputs, targets, "... v, ... v -> ...") + log_z
+    targets = torch.nn.functional.one_hot(targets.to(torch.int64), inputs.shape[-1])
+    loss = -einsum(inputs, targets.to(inputs.dtype), "... v, ... v -> ...") + log_z
     return loss.mean()
 
 
@@ -414,6 +449,10 @@ class AdamW(torch.optim.Optimizer):
                 state["v"] = v
                 state["t"] = t + 1
 
+    def set_learning_rate(self, lr: float):
+        for group in self.param_groups:
+            group["lr"] = lr
+
 
 def cosine_learning_rate_schedule(
     t: int, lr_max: float, lr_min: float, t_warmup: int, t_cap: int
@@ -424,6 +463,18 @@ def cosine_learning_rate_schedule(
         return lr_min + 0.5 * (
             1 + math.cos((t - t_warmup) / (t_cap - t_warmup) * math.pi)
         ) * (lr_max - lr_min)
+    return lr_min
+
+
+def wsd_learning_rate_schedule(
+    t: int, lr_max: float, lr_min: float, t_warmup: int, t_warmdown: int, t_cap: int
+) -> float:
+    if t < t_warmup:
+        return t / t_warmup * lr_max
+    if t <= t_warmdown:
+        return lr_max
+    if t <= t_cap:
+        return lr_max + (t - t_warmdown) / (t_cap - t_warmdown) * (lr_min - lr_max)
     return lr_min
 
 
@@ -449,6 +500,8 @@ def get_batch(x: np.ndarray, batch_size: int, context_length: int, device: str):
     for start in starts:
         inputs.append(x[start : start + context_length])
         targets.append(x[start + 1 : start + context_length + 1])
+    inputs = np.stack(inputs)
+    targets = np.stack(targets)
     inputs = torch.tensor(inputs).to(device)
     targets = torch.tensor(targets).to(device)
     return inputs, targets
@@ -466,6 +519,8 @@ def save_checkpoint(
         "iteration": iteration,
     }
     torch.save(obj, out)
+    if isinstance(out, str):
+        print(f"checkpoint saved to {out!r}")
 
 
 def load_checkpoint(
