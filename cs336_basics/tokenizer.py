@@ -18,6 +18,7 @@ class Tokenizer:
         self.vocab = vocab
         self.id_by_token = {v: k for k, v in vocab.items()}
         self.merges = merges
+        self.od_by_merge = {v: k for k, v in enumerate(merges)}
         self.special_tokens = special_tokens or []
         self.special_tokens_escaped = sorted(
             [re.escape(st) for st in self.special_tokens], key=lambda p: -len(p)
@@ -62,6 +63,53 @@ class Tokenizer:
                 tokens = [pre_token.encode("utf-8")]
             else:
                 tokens = [bytes([b]) for b in pre_token.encode("utf-8")]
+            corpus.append([tokens, locs])
+
+        for tokens, _ in corpus:
+            while len(tokens) >= 2:
+                curr_order = float("inf")
+                j = None
+                for i in range(len(tokens) - 1):
+                    order = self.od_by_merge.get((tokens[i], tokens[i + 1]))
+                    if order is not None and order < curr_order:
+                        curr_order = order
+                        j = i
+                if j is None:
+                    break
+                tokens[j] = b"".join((tokens[j], tokens[j + 1]))
+                for i in range(j + 1, len(tokens) - 1):
+                    tokens[i] = tokens[i + 1]
+                tokens[:] = tokens[:-1]
+
+        all_token_ids = [None] * num_pre_tokens
+        for tokens, locs in corpus:
+            token_ids = [self.id_by_token[t] for t in tokens]
+            for loc in locs:
+                all_token_ids[loc] = token_ids
+        return list(itertools.chain.from_iterable(all_token_ids))
+
+    def encode_v0(self, text: str) -> list[int]:
+        locs_by_pre_token = collections.defaultdict(list)
+        chunks = (
+            re.split(self.special_tokens_pattern, text)
+            if self.special_tokens
+            else [text]
+        )
+        num_pre_tokens = 0
+        for chunk in chunks:
+            if chunk in self.special_tokens:
+                locs_by_pre_token[chunk].append(num_pre_tokens)
+                num_pre_tokens += 1
+                continue
+            for m in re.finditer(common.PAT, chunk):
+                locs_by_pre_token[m.group(0)].append(num_pre_tokens)
+                num_pre_tokens += 1
+        corpus = []
+        for pre_token, locs in locs_by_pre_token.items():
+            if pre_token in self.special_tokens:
+                tokens = [pre_token.encode("utf-8")]
+            else:
+                tokens = [bytes([b]) for b in pre_token.encode("utf-8")]
             corpus.append([tokens, locs, len(tokens)])
 
         pair_locations = collections.defaultdict(set)
@@ -78,7 +126,7 @@ class Tokenizer:
             merge = b"".join(pair)
             for cid in pair_locations.pop(pair):
                 pre_token = corpus[cid]
-                tokens, locs, num_tokens = pre_token
+                tokens, _, num_tokens = pre_token
                 i, j = 0, 0
                 while j < num_tokens:
                     if j == num_tokens - 1 or (tokens[j], tokens[j + 1]) != pair:

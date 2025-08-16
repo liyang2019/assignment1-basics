@@ -4,7 +4,7 @@ import datetime
 import os
 import numpy as np
 
-import tokenizer
+from cs336_basics import tokenizer
 
 PAT = re.compile(
     r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
